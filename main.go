@@ -9,11 +9,15 @@ import (
 	"log"
 	"net/http"
 	"net/url"
+	"net/mail"
 	"os"
 	"os/user"
 	"path/filepath"
 	"strings"
 	"strconv"
+	"encoding/csv"
+	"time"
+	
 
 	"golang.org/x/net/context"
 	"golang.org/x/oauth2"
@@ -25,7 +29,10 @@ import (
 type TargetMail struct {
 	index int
 	subject string
-	date string
+	//date string
+	date time.Time
+	stockId string
+	op string
 }
 
 type TargetData struct {
@@ -126,46 +133,125 @@ func showLable(usr string, srv *gmail.Service) {
 	}
 }
 
-func showThreadsFromLable(usr string, srv *gmail.Service, lableId string) {
-	thrList, err := srv.Users.Threads.List(usr).LabelIds(lableId).Do()
+func test(usr string, srv *gmail.Service, lableId string) {
+	
+	thrList := srv.Users.Threads.List(usr)
+	thrList.LabelIds(lableId)
+	thrList.MaxResults(1000)
+	
+	t, err := thrList.Do()
 	if err != nil {
 		log.Fatalf("Unable to retrieve threads from labels %s. %v", lableId, err)
 	}
-	//fmt.Printf("thr_list: %#v \n\n", thr_list)
-	fmt.Printf("thr_list.Threads[1]: %#v \n\n", thrList.Threads[0])
+
+	b, _ := t.MarshalJSON()
+	os.Stdout.Write(b)
+
+	for i, list1 := range t.Threads {
+		aaa := list1.Id
+		//fmt.Printf("--- %s\n", aaa)
+		thr3, _ := srv.Users.Threads.Get(usr, aaa).Do()
+		//buf := "--- " + strconv.FormatInt(int64(i), 10) + ":"
+		var mMail TargetMail
+		mMail.index = i
+		for _, list2 := range thr3.Messages[0].Payload.Headers {
+			switch list2.Name {
+				case "Subject":
+					mMail.subject = list2.Value
+				case "Date":
+					mMail.date, _ = mail.ParseDate(list2.Value)
+			}
+		}
+		/*
+		if (strings.Contains(list1.Snippet, "買進") ||
+			strings.Contains(list1.Snippet, "持有")) {
+			targetMail = append(targetMail, mMail)
+		}
+		*/
+		targetMail = append(targetMail, mMail)
+		fmt.Printf("--- %s: %s %s\n", strconv.FormatInt(int64(i), 10), mMail.subject, mMail.date)
+		if i == 10 {
+			//break
+		}
+	}
+
+}
+
+func showThreadsFromLable(usr string, srv *gmail.Service, lableId string) {
+	thrList := srv.Users.Threads.List(usr)
+	thrList.LabelIds(lableId)
+	thrList.MaxResults(1000)
+	thr, err := thrList.Do()
+	if err != nil {
+		log.Fatalf("Unable to retrieve threads from labels %s. %v", lableId, err)
+	}
+	fmt.Printf("thr: %#v \n\n", thr)
+	fmt.Printf("thr.Threads: len: %d, cap: %d \n\n", len(thr.Threads), cap(thr.Threads))
+	fmt.Printf("thr.Threads[1]: %#v \n\n", thr.Threads[0])
 	//fmt.Println("Snippet: ", thr_list.Threads[1].Snippet, "\n")
 	//fmt.Println("Id: ", thr_list.Threads[1].Id, "\n")
-	//thrId := thrList.Threads[0].Id
-	//thrId2 := thrList.Threads[2].Id
+	//thrId := thr.Threads[0].Id
+	//thrId2 := thr.Threads[2].Id
 	//thr, err := srv.Users.Threads.Get(usr, thrId).Do()
 	//thr2, err := srv.Users.Threads.Get(usr, thrId2).Do()
 	//fmt.Printf("thr: %#v \n\n", thr)
 	//fmt.Printf("thr2: %#v \n\n", thr2)
 
-	for i, list1 := range thrList.Threads {
-		aaa := list1.Id
-		//fmt.Printf("--- %s\n", aaa)
-		thr3, _ := srv.Users.Threads.Get(usr, aaa).Do()
+	for i := len(thr.Threads)-1; i >= 0; i-- {
+		id := thr.Threads[i].Id
+
+		t, _ := srv.Users.Threads.Get(usr, id).Do()
+		//fmt.Printf("t: %#v \n\n", t)
 		//buf := "--- " + strconv.FormatInt(int64(i), 10) + ":"
-		var mail TargetMail
-		mail.index = i
-		for _, list2 := range thr3.Messages[0].Payload.Headers {
+		var mMail TargetMail
+		mMail.index = i
+		for _, list2 := range t.Messages[0].Payload.Headers {
 			switch list2.Name {
 				case "Subject":
-					mail.subject = list2.Value
+					mMail.subject = list2.Value
 				case "Date":
-					mail.date = list2.Value
+					mMail.date, _ = mail.ParseDate(list2.Value)
 			}
 		}
-		if (strings.Contains(list1.Snippet, "買進") ||
-			strings.Contains(list1.Snippet, "持有")) {
-			targetMail = append(targetMail, mail)
-		}
-		fmt.Printf("--- %s: %s %s\n", strconv.FormatInt(int64(i), 10), mail.subject, mail.date)
-		if i == 10 {
+		ScanStockId(&mMail)
+
+		targetMail = append(targetMail, mMail)
+
+		fmt.Printf("--- %s: %s\n", strconv.FormatInt(int64(i), 10), mMail.subject)
+		if i == 350 {
 			break
 		}
 	}
+}
+
+func writeToCsv() {
+	file := openFile("mail.csv", os.O_WRONLY|os.O_CREATE)
+	w := csv.NewWriter(file.writer)
+	for _, v := range targetMail {
+		t := fmt.Sprintf("%d/%d/%d", v.date.Year(), v.date.Month(), v.date.Day())
+		s := []string{v.stockId, t, v.op, v.subject}
+		w.Write(s)
+	}
+	w.Flush()
+}
+
+func ScanStockId(m *TargetMail) {
+		found := false
+		if strings.Contains(m.subject, "買進") {
+			m.op = "買進"
+			found = true
+		} else if strings.Contains(m.subject, "持有") {
+			m.op = "持有"
+			found = true
+		}
+		if found {
+			re := regexp.MustCompile("\\(\\d\\d\\d\\d")
+			s := re.FindString(m.subject)
+			if s != "" {
+				m.stockId = s[1:]
+				//fmt.Printf("--- s: %s, %s\n", m.stockId, m.subject)
+			}
+		}
 }
 
 func main() {
@@ -189,16 +275,9 @@ func main() {
 	if err != nil {
 		log.Fatalf("Unable to retrieve gmail Client %v", err)
 	}
-
+	//test(usr, srv, "Label_10")
 	//showLable(usr, srv)
 	showThreadsFromLable(usr, srv, "Label_10")
-
-	re := regexp.MustCompile("\\(.*? ")
-	for i, mail := range targetMail {
-		var target TargetData
-		target.symbol = re.FindString(mail.subject)[1:]
-		target.mail = mail
-		targetData = append(targetData, target)
-		fmt.Printf("--- %d: %s %s %s\n", i, target.symbol, target.mail.subject, target.mail.date)
-	}
+	writeToCsv()
+	
 }
